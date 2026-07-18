@@ -1,7 +1,8 @@
 // A self-contained web-search tool over the Tavily API — pure Katari, no sidecar: the request body
-// is built as `json`, the POST is the prelude's `http.post_json`, and the response is parsed as
-// `json`. Its own capability (`get_tavily_key`), the `search` agent an app hands to the model as a
-// tool, and the provider that makes wiring it a one-liner:
+// is built as a plain value tree, the POST is the prelude's `http.post_json` (which serialises the
+// body and parses the reply), and the response is read with the `json` readers. Its own capability
+// (`get_tavily_key`), the `search` agent an app hands to the model as a tool, and the provider that
+// makes wiring it a one-liner:
 // `use tavily.provider(api_key = env.get_secret(key = "TAVILY_API_KEY"))`.
 
 @"The Tavily API key capability (provided once at the root by `use tavily.provider(...)`)."
@@ -21,23 +22,19 @@ agent provider[R, effect E](
 @"Tool: search the web and return the top results as a compact digest (title, URL, content snippet
 per hit — small enough to feed straight back to the model)."
 agent search(query: string) -> string {
-  let body = json.stringify(value = json.json_object(entries = {
-    query = json.json_string(value = query),
-    max_results = json.json_integer(value = 5),
-  }))
   let response = http.post_json(
     url = "https://api.tavily.com/search",
-    body = body,
-    headers = record.set(target = record.empty(), key = "Authorization", value = "Bearer " ++ get_tavily_key()),
+    body = { query = query, max_results = 5 },
+    headers = { "Authorization" = "Bearer " ++ get_tavily_key() },
   )
-  render_results(parsed = json.parse(text = response))
+  render_results(parsed = response)
 }
 
 @"One digest line per result; a shape the API never promised (no `results` array) degrades to a note
 rather than an error — the model can rephrase and retry."
-agent render_results(parsed: json.json) -> string {
+agent render_results(parsed: unknown) -> string {
   match (json.field(target = parsed, key = "results")) {
-    case json.json_array(items => items) -> {
+    case array(items) -> {
       let lines = for (let item in items) {
         let title = json.text(target = json.field(target = item, key = "title"))
         let url = json.text(target = json.field(target = item, key = "url"))
