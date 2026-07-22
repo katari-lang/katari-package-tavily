@@ -1,48 +1,77 @@
-// A self-contained web-search tool over the Tavily API — pure Katari, no sidecar: the request body
+// A self-contained web-search library over the Tavily API — pure Katari, no sidecar: the request body
 // is built as a plain value tree, the POST is the prelude's `http.post_json` (which serialises the
-// body and parses the reply), and the response is read with the `json` readers. Its own capability
-// (`get_tavily_key`), the `search` agent an app hands to the model as a tool, and the provider that
-// makes wiring it a one-liner:
-// `use tavily.provider(api_key = env.get_secret(key = "TAVILY_API_KEY"))`.
+// body and parses the reply), and the response is read with the `json` readers into plain data values.
+// `search` returns STRUCTURED hits (route the urls, filter, rank); `render` is the model-facing digest
+// of a hit list; `digest` composes the two for the one-call tool shape. The capability follows the
+// credentials unification: one nominal `credential` request, provided from a `credentials.source` —
+// `use tavily.provider(source = credentials.env(key = "TAVILY_API_KEY"))`.
 
-@"The Tavily API key capability (provided once at the root by `use tavily.provider(...)`)."
-request get_tavily_key() -> string of private
+@"The Tavily credential capability — provided at the root by `use tavily.provider(...)`, resolved
+per call (an env rotation or an oauth refresh lands without a restart)."
+request credential() -> string of private
 
-@"Provide the Tavily API key capability for the extent of the continuation."
+@"Provide the `credential` capability from @source@ for the extent of the continuation. The source
+is a NAME (where the credential lives), never a value: resolution happens at each use."
 agent provider[R, effect E](
-  api_key: string of private,
-  continuation: agent (value: null) -> R with {...E, get_tavily_key},
-) -> R with E {
-  use handler (var key = api_key) {
-    request get_tavily_key() { next key }
+  source: credentials.source,
+  continuation: agent (value: null) -> R with {...E, credential},
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
+  use handler {
+    request credential() -> string of private { next credentials.resolve(source = source) }
   }
   continuation(value = null)
 }
 
-@"Tool: search the web and return the top results as a compact digest (title, URL, content snippet
-per hit — small enough to feed straight back to the model)."
-agent search(query: string) -> string {
+@"One search hit, as the API reports it: the page title, its URL, and a content snippet."
+data result(
+  @"The page title." title: string,
+  @"The page URL." url: string,
+  @"A content snippet of the page." content: string,
+)
+
+@"Search the web and return the top hits as structured results — a value the program can route
+(follow the urls, filter, rank) rather than a pre-rendered string. A reply without the promised
+`results` array degrades to the empty list (the API never contractually promised the shape)."
+agent search(
+  @"The search query." query: string,
+  @"How many hits to ask for." max_results: integer ?= 5,
+) -> array[result] {
   let response = http.post_json(
     url = "https://api.tavily.com/search",
-    body = { query = query, max_results = 5 },
-    headers = { "Authorization" = "Bearer " ++ get_tavily_key() },
+    body = { query = query, max_results = max_results },
+    headers = { "Authorization" = "Bearer " ++ credential() },
   )
-  render_results(parsed = response)
+  match (json.field(target = response, key = "results")) {
+    case array(items) ->
+      for (let item in items) {
+        next result(
+          title = json.text(target = json.field(target = item, key = "title")),
+          url = json.text(target = json.field(target = item, key = "url")),
+          content = json.text(target = json.field(target = item, key = "content")),
+        )
+      }
+    case _ -> []
+  }
 }
 
-@"One digest line per result; a shape the API never promised (no `results` array) degrades to a note
-rather than an error — the model can rephrase and retry."
-agent render_results(parsed: unknown) -> string {
-  match (json.field(target = parsed, key = "results")) {
-    case array(items) -> {
-      let lines = for (let item in items) {
-        let title = json.text(target = json.field(target = item, key = "title"))
-        let url = json.text(target = json.field(target = item, key = "url"))
-        let content = json.text(target = json.field(target = item, key = "content"))
-        next f"- ${title} (${url})\n  ${content}"
-      }
-      string.join(parts = lines, separator = "\n")
+@"The model-facing digest of a hit list: one `- title (url)` line with its snippet per hit, or a
+short note for the empty list."
+agent render(results: array[result]) -> string {
+  if (array.length(target = results) == 0) {
+    "(no results)"
+  } else {
+    agent line(value: result) -> string {
+      f"- ${value.title} (${value.url})\n  ${value.content}"
     }
-    case _ -> "(no results)"
+    string.join(parts = array.map(target = results, transform = line), separator = "\n")
   }
+}
+
+@"Tool: search the web and return the top results as a compact digest — `render` over `search`, the
+one-call shape an app hands a model."
+agent digest(
+  @"The search query." query: string,
+  @"How many hits to ask for." max_results: integer ?= 5,
+) -> string {
+  render(results = search(query = query, max_results = max_results))
 }

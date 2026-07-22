@@ -1,6 +1,6 @@
 [package]
 name = "tavily"
-version = "0.1.0"
+version = "0.1.1"
 description = "Web search as a Katari tool over the Tavily API — pure Katari, no sidecar."
 
 [runtime]
